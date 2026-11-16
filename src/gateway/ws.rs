@@ -1,6 +1,6 @@
 use std::env::consts;
 use std::io::Read;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use flate2::read::ZlibDecoder;
 #[cfg(feature = "transport_compression_zlib")]
@@ -32,11 +32,13 @@ use super::{
     TransportCompression,
 };
 use crate::constants::{self, Opcode};
+use crate::model::Timestamp;
 use crate::model::event::GatewayEvent;
 use crate::model::gateway::{GatewayCapabilities, GatewayIntents, ShardInfo};
 #[cfg(feature = "voice")]
 use crate::model::id::ChannelId;
 use crate::model::id::{GuildId, UserId};
+use crate::model::user::OnlineStatus;
 use crate::{Error, Result};
 
 #[derive(Serialize)]
@@ -62,8 +64,20 @@ struct ChunkGuildMessage<'a> {
 struct PresenceUpdateMessage<'a> {
     afk: bool,
     status: &'a str,
-    since: SystemTime,
+    since: Option<i64>,
     activities: &'a [ActivityData],
+}
+
+impl<'a> From<&'a PresenceData> for PresenceUpdateMessage<'a> {
+    fn from(presence: &'a PresenceData) -> Self {
+        Self {
+            afk: false,
+            status: presence.status.name(),
+            since: (presence.status == OnlineStatus::Idle)
+                .then(|| Timestamp::now().unix_timestamp_millis()),
+            activities: presence.activity.as_slice(),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -386,9 +400,6 @@ impl WsClient {
         capabilities: Option<GatewayCapabilities>,
         presence: &PresenceData,
     ) -> Result<()> {
-        let now = SystemTime::now();
-        let activities = presence.activity.as_slice();
-
         debug!("[{:?}] Identifying", shard);
 
         let msg = WebSocketMessage {
@@ -405,12 +416,7 @@ impl WsClient {
                     device: "serenity",
                     os: consts::OS,
                 },
-                presence: PresenceUpdateMessage {
-                    afk: false,
-                    since: now,
-                    status: presence.status.name(),
-                    activities,
-                },
+                presence: presence.into(),
             },
         };
 
@@ -426,19 +432,11 @@ impl WsClient {
         shard_info: &ShardInfo,
         presence: &PresenceData,
     ) -> Result<()> {
-        let now = SystemTime::now();
-        let activities = presence.activity.as_slice();
-
         debug!("[{shard_info:?}] Sending presence update");
 
         self.send_json(&WebSocketMessage {
             op: Opcode::PresenceUpdate,
-            d: WebSocketMessageData::PresenceUpdate(PresenceUpdateMessage {
-                afk: false,
-                since: now,
-                activities,
-                status: presence.status.name(),
-            }),
+            d: WebSocketMessageData::PresenceUpdate(presence.into()),
         })
         .await
     }
@@ -492,5 +490,72 @@ impl WsClient {
             },
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn presence_since_is_null_when_not_idle() {
+        for status in [
+            OnlineStatus::Online,
+            OnlineStatus::DoNotDisturb,
+            OnlineStatus::Invisible,
+            OnlineStatus::Offline,
+        ] {
+            let presence = PresenceData {
+                activity: None,
+                status,
+            };
+            let json = serde_json::to_value(PresenceUpdateMessage::from(&presence)).unwrap();
+            assert_eq!(json["since"], serde_json::Value::Null, "status: {status:?}");
+            assert!(json.get("since").is_some(), "since must be explicitly null");
+        }
+    }
+
+    #[test]
+    fn identify_and_presence_update_since_are_integer_milliseconds_when_idle() {
+        let presence = PresenceData {
+            activity: None,
+            status: OnlineStatus::Idle,
+        };
+        let shard = ShardInfo::default();
+        let before = Timestamp::now().unix_timestamp_millis();
+        let messages = [
+            WebSocketMessage {
+                op: Opcode::Identify,
+                d: WebSocketMessageData::Identify {
+                    compress: false,
+                    token: "test-token",
+                    large_threshold: constants::LARGE_THRESHOLD,
+                    shard: &shard,
+                    intents: GatewayIntents::empty(),
+                    capabilities: None,
+                    properties: IdentifyProperties {
+                        browser: "serenity",
+                        device: "serenity",
+                        os: consts::OS,
+                    },
+                    presence: (&presence).into(),
+                },
+            },
+            WebSocketMessage {
+                op: Opcode::PresenceUpdate,
+                d: WebSocketMessageData::PresenceUpdate((&presence).into()),
+            },
+        ];
+        let after = Timestamp::now().unix_timestamp_millis();
+
+        for message in messages {
+            let json = serde_json::to_value(message).unwrap();
+            let presence = if json["op"] == 2 { &json["d"]["presence"] } else { &json["d"] };
+            let since = presence["since"].as_i64().expect("since must be an integer timestamp");
+            assert!((before..=after).contains(&since), "since must use Unix milliseconds");
+            assert_eq!(presence["status"], "idle");
+            assert_eq!(presence["activities"], serde_json::json!([]));
+            assert_eq!(presence["afk"], false);
+        }
     }
 }
